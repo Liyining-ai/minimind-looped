@@ -358,14 +358,17 @@ class MiniMindBlock(nn.Module):
         return hidden_states, present_key_value
 
 
-class MiniMindModel(nn.Module):
+class LoopedMiniMindModel(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        assert self.num_hidden_layers % 2 == 0   
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        # self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        # Only two blocks, shared and reused
+        self.shared_blocks = nn.ModuleList([MiniMindBlock(l, config) for l in range(2)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
@@ -380,7 +383,7 @@ class MiniMindModel(nn.Module):
                 use_cache: bool = False,
                 **kwargs):
         batch_size, seq_length = input_ids.shape
-        past_key_values = past_key_values or [None] * len(self.layers)
+        past_key_values = past_key_values or [None] * len(self.shared_blocks)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
@@ -391,22 +394,25 @@ class MiniMindModel(nn.Module):
         )
 
         presents = []
-        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
-            hidden_states, present = layer(
-                hidden_states,
-                position_embeddings,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attention_mask=attention_mask
-            )
-            presents.append(present)
+        loop_steps = self.num_hidden_layers // 2
+        for step in range(loop_steps):
+            for layer_idx, (block, past_key_value) in enumerate(zip(self.shared_blocks, past_key_values)):
+                hidden_states, present = block(
+                    hidden_states,
+                    position_embeddings,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    attention_mask=attention_mask
+                )
+                if step==0:
+                    presents.append(present)
 
         hidden_states = self.norm(hidden_states)
 
         aux_loss = sum(
-            layer.mlp.aux_loss
-            for layer in self.layers
-            if isinstance(layer.mlp, MOEFeedForward)
+            block.mlp.aux_loss
+            for block in self.shared_blocks
+            if isinstance(block.mlp, MOEFeedForward)
         )
 
         return hidden_states, presents, aux_loss
