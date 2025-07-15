@@ -404,8 +404,7 @@ class LoopedMiniMindModel(nn.Module):
                     use_cache=use_cache,
                     attention_mask=attention_mask
                 )
-                if step==0:
-                    presents.append(present)
+                presents.append(present)
 
         hidden_states = self.norm(hidden_states)
 
