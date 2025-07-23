@@ -396,7 +396,8 @@ class LoopedMiniMindModel(nn.Module):
         presents = []
         loop_steps = self.num_hidden_layers // 2
         for step in range(loop_steps):
-            for layer_idx, (block, past_key_value) in enumerate(zip(self.shared_blocks, past_key_values)):
+            step_past_key_values = past_key_values[step * len(self.shared_blocks):(step + 1) * len(self.shared_blocks)]
+            for layer_idx, (block, past_key_value) in enumerate(zip(self.shared_blocks, step_past_key_values)):
                 hidden_states, present = block(
                     hidden_states,
                     position_embeddings,
