@@ -427,64 +427,6 @@ class HyperMiniMindModel(nn.Module):
 
         return hidden_states, presents, aux_loss
 
-class LoopedMiniMindModel(nn.Module):
-    def __init__(self, config: MiniMindConfig):
-        super().__init__()
-        self.config = config
-        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
-        assert self.num_hidden_layers % 2 == 0   
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.dropout)
-        # self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
-        # Only two blocks, shared and reused
-        self.shared_blocks = nn.ModuleList([MiniMindBlock(l, config) for l in range(2)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
-                                                    end=config.max_position_embeddings, theta=config.rope_theta)
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
-
-    def forward(self,
-                input_ids: Optional[torch.Tensor] = None,
-                attention_mask: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = False,
-                **kwargs):
-        batch_size, seq_length = input_ids.shape
-        past_key_values = past_key_values or [None] * len(self.shared_blocks)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
-
-        position_embeddings = (
-            self.freqs_cos[start_pos:start_pos + seq_length],
-            self.freqs_sin[start_pos:start_pos + seq_length]
-        )
-
-        presents = []
-        loop_steps = self.num_hidden_layers // 2
-        for step in range(loop_steps):
-            step_past_key_values = past_key_values[step * len(self.shared_blocks):(step + 1) * len(self.shared_blocks)]
-            for layer_idx, (block, past_key_value) in enumerate(zip(self.shared_blocks, step_past_key_values)):
-                hidden_states, present = block(
-                    hidden_states,
-                    position_embeddings,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache,
-                    attention_mask=attention_mask
-                )
-                presents.append(present)
-
-        hidden_states = self.norm(hidden_states)
-
-        aux_loss = sum(
-            block.mlp.aux_loss
-            for block in self.shared_blocks
-            if isinstance(block.mlp, MOEFeedForward)
-        )
-
-        return hidden_states, presents, aux_loss
 
 class TransformerBlockHyperNet(nn.Module):
     def __init__(self, config: MiniMindConfig, output_dim: int):
@@ -541,107 +483,7 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-class TCMiniMindBlock(nn.Module):
-    def __init__(self, layer_id: int, config: MiniMindConfig):
-        super().__init__()
-        self.num_attention_heads = config.num_attention_heads
-        self.hidden_size = config.hidden_size
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.self_attn = Attention(config)
 
-        self.layer_id = layer_id
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
-
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None, mod_params):
-        gate_msa, gate_mlp, scale_msa, scale_mlp = mod_params  # 每个 shape: (B, H)
-        gate_msa = gate_msa.unsqueeze(1)  # (B, 1, H)
-        gate_mlp = gate_mlp.unsqueeze(1)
-        scale_msa = scale_msa.unsqueeze(1)
-        scale_mlp = scale_mlp.unsqueeze(1)
-        residual = hidden_states
-        hidden_states, present_key_value = self.self_attn(
-            (1+scale_msa)*self.input_layernorm(hidden_states), position_embeddings,
-            past_key_value, use_cache, attention_mask
-        )
-        hidden_states = gate_msa * hidden_states + residual
-        hidden_states = hidden_states + gate_mlp * self.mlp(self.post_attention_layernorm(hidden_states) * (1 + scale_mlp))
-        return hidden_states, present_key_value
-        
-class TCLoopedMiniMindModel(nn.Module):
-    def __init__(self, config: MiniMindConfig):
-        super().__init__()
-        self.config = config
-        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
-        assert self.num_hidden_layers % 2 == 0   
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.dropout)
-        # self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
-        # Only two blocks, shared and reused
-        self.shared_blocks = nn.ModuleList([TCMiniMindBlock(l, config) for l in range(2)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
-                                                    end=config.max_position_embeddings, theta=config.rope_theta)
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
-
-        # 时间步嵌入器和 AdaLN 调制器
-        self.timestep_embedder = TimestepEmbedder(config.hidden_size)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(config.hidden_size, 4 * config.hidden_size, bias=True))
-        nn.init.zeros_(self.adaLN_modulation[1].weight)
-        nn.init.zeros_(self.adaLN_modulation[1].bias)
-        # self.adaLN_modulation = nn.Sequential(
-        #     nn.SiLU(),
-        #     nn.Linear(config.hidden_size, 4 * config.hidden_size)  # gate_msa, gate_mlp, scale_msa, scale_mlp
-        # )
-
-    def forward(self,
-                input_ids: Optional[torch.Tensor] = None,
-                attention_mask: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = False,
-                **kwargs):
-        batch_size, seq_length = input_ids.shape
-        past_key_values = past_key_values or [None] * len(self.shared_blocks)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
-
-        position_embeddings = (
-            self.freqs_cos[start_pos:start_pos + seq_length],
-            self.freqs_sin[start_pos:start_pos + seq_length]
-        )
-
-        presents = []
-        loop_steps = self.num_hidden_layers // 2
-        t = 0
-        for step in range(loop_steps):
-            step_past_key_values = past_key_values[step * len(self.shared_blocks):(step + 1) * len(self.shared_blocks)]
-            for layer_idx, (block, past_key_value) in enumerate(zip(self.shared_blocks, step_past_key_values)):
-                t_emb = self.timestep_embedder(torch.full((batch_size,), t, dtype=torch.long, device=device))
-                mod_params = self.adaLN_modulation(t_emb).chunk(4, dim=-1)
-                hidden_states, present = block(
-                    hidden_states,
-                    position_embeddings,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache,
-                    attention_mask=attention_mask,
-                    mod_params
-                )
-                presents.append(present)
-                t = t + 1
-
-        hidden_states = self.norm(hidden_states)
-
-        aux_loss = sum(
-            block.mlp.aux_loss
-            for block in self.shared_blocks
-            if isinstance(block.mlp, MOEFeedForward)
-        )
-
-        return hidden_states, presents, aux_loss
                     
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
@@ -649,7 +491,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
-        self.model = LoopedMiniMindModel(self.config)
+        self.model = HyperMiniMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
         self.OUT = CausalLMOutputWithPast()
