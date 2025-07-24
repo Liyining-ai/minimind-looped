@@ -357,6 +357,75 @@ class MiniMindBlock(nn.Module):
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
+class HyperMiniMindModel(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        # self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+# Shared block (structure only for parameter size reference)
+        self.shared_block = MiniMindBlock(0, config)  # Create one shared block to run actual forward pass (parameters will be overwritten by hypernet)
+        self.block_param_size = sum(p.numel() for p in self.shared_block.parameters() if p.requires_grad)
+
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
+                                                    end=config.max_position_embeddings, theta=config.rope_theta)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        # Hypernetwork for all blocks
+        self.hypernet = TransformerBlockHyperNet(config, self.block_param_size)
+        
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                **kwargs):
+        batch_size, seq_length = input_ids.shape
+        past_key_values = past_key_values or [None] * self.config.num_hidden_layers
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos:start_pos + seq_length],
+            self.freqs_sin[start_pos:start_pos + seq_length]
+        )
+
+        presents = []
+        # return hidden_states, presents, aux_loss
+        for layer_idx in range(self.config.num_hidden_layers):
+            # Generate weights from hypernetwork
+            t_idx = torch.full((1,), layer_idx, device=input_ids.device)
+            t_embedding = TimestepEmbedder.timestep_embedding(t_idx, 256)
+            flat_w = self.hypernet(t_embedding).view(-1)
+
+            # Load weights into shared block
+            ptr = 0
+            for name, param in self.shared_block.named_parameters():
+                n_elems = param.numel()
+                new_w = flat_w[ptr:ptr + n_elems].view_as(param)
+                param.data.copy_(new_w)
+                ptr += n_elems
+
+            # Run forward with injected weights
+            hidden_states, present = self.shared_block(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_values[layer_idx],
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        aux_loss = self.shared_block.mlp.aux_loss if isinstance(self.shared_block.mlp, MOEFeedForward) else 0.0
+
+        return hidden_states, presents, aux_loss
 
 class LoopedMiniMindModel(nn.Module):
     def __init__(self, config: MiniMindConfig):
@@ -416,7 +485,22 @@ class LoopedMiniMindModel(nn.Module):
         )
 
         return hidden_states, presents, aux_loss
-                    
+
+class TransformerBlockHyperNet(nn.Module):
+    def __init__(self, config: MiniMindConfig, output_dim: int):
+        super().__init__()
+        hidden = config.num_hidden_layers  # 隐层宽度可调整
+        self.net = nn.Sequential(
+            nn.Linear(256, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, output_dim),
+        )
+
+    def forward(self, t: torch.Tensor):
+        # 输入 t 是 shape [batch_size,] 的层编号，输出为 [batch, output_dim]
+        # t = t.float().unsqueeze(-1)  # 转为 [batch,1]
+        return self.net(t)
+        
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
