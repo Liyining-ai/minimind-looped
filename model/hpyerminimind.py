@@ -423,21 +423,16 @@ class HyperMiniMindModel(nn.Module):
             flat_w = self.hypernet(t_embedding).view(-1)
 
             # Load weights into shared block
+            param_dict = {}
             ptr = 0
             for name, param in self.shared_block.named_parameters():
                 n_elems = param.numel()
                 new_w = flat_w[ptr:ptr + n_elems].view_as(param)
-                param.data.copy_(new_w)
+                param_dict[name] = new_w
                 ptr += n_elems
 
             # Run forward with injected weights
-            hidden_states, present = self.shared_block(
-                hidden_states,
-                position_embeddings,
-                past_key_value=past_key_values[layer_idx],
-                use_cache=use_cache,
-                attention_mask=attention_mask
-            )
+            hidden_states, present = functional_call(self.shared_block,param_dict,(hidden_states, position_embeddings, past_key_values[layer_idx], use_cache, attention_mask))
             presents.append(present)
 
         hidden_states = self.norm(hidden_states)
