@@ -116,12 +116,10 @@ class LinearAttention(nn.Module):
         self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
-
-        self.q_proj = nn.Linear(args.hidden_size, self.n_local_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.n_local_heads * self.head_dim, args.hidden_size, bias=False)
-
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
 
@@ -146,6 +144,14 @@ class LinearAttention(nn.Module):
 
         if seq_len > 1:
             scores = q @ k.transpose(-2, -1)
+            # 1. 创建一个下三角矩阵作为掩码 (值为True的部分是允许关注的)
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
+            # 2. Reshape to (1, 1, seq_len, seq_len) 以便和 scores 的 (bsz, n_heads, seq_len, seq_len) 维度匹配
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            # 3. 将所有“未来”位置的分数设置为0
+            scores = scores.masked_fill(~causal_mask, 0.0)
+
+
             if attention_mask is not None:
                 attn_mask = attention_mask.view(bsz, 1, 1, -1)
                 scores = scores.masked_fill(attn_mask == 0, 0)
@@ -165,11 +171,12 @@ class LinearAttention(nn.Module):
             k_t = k[:, :, 0, :].to(torch.float32)
             v_t = v[:, :, 0, :].to(torch.float32)
 
-            denom = (q_t * k_sum).sum(dim=-1, keepdim=True).clamp(min=1e-6)
-            out_step = (q_t @ kv_sum) / denom
-
             kv_sum = kv_sum + torch.einsum("bhd,bhe->bhde", k_t, v_t)
             k_sum = k_sum + k_t
+            
+            denom = (q_t * k_sum).sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            out_step = (q_t @ kv_sum) / denom
+            
 
             output = out_step.unsqueeze(2)
             cache = (kv_sum, k_sum)
@@ -177,7 +184,7 @@ class LinearAttention(nn.Module):
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, cache
-
+        
 # ========================
 #   MLP/Gating/MoE
 # ========================
