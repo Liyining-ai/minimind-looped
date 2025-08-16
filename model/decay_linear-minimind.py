@@ -185,6 +185,99 @@ class LinearAttention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
         return output, cache
         
+class DecayLinearAttention(nn.Module):
+    def __init__(self, args: MiniMindConfig):
+        super().__init__()
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+
+        self.n_local_heads = args.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+
+        self.feature_map = lambda x: F.elu(x) + 1
+
+        # === decay 参数 γ ===
+        self.decay = getattr(args, "decay", 0.99)  # 可以从 config 里传入
+
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        bsz, seq_len, _ = x.size()
+
+        q = self.q_proj(x).view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        k = self.k_proj(x).view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos[:seq_len], sin[:seq_len])
+
+        k = repeat_kv(k, self.n_rep)
+        v = repeat_kv(v, self.n_rep)
+
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        q, k = self.feature_map(q), self.feature_map(k)
+
+        if seq_len > 1:  # === parallel 模式 ===
+            scores = q @ k.transpose(-2, -1)
+
+            # decay mask: (seq_len, seq_len), 下三角 γ^(i-j)
+            idx = torch.arange(seq_len, device=x.device)
+            D = (self.decay ** (idx.unsqueeze(0) - idx.unsqueeze(1))).masked_fill(
+                idx.unsqueeze(0) < idx.unsqueeze(1), 0.0
+            )
+            scores = scores * D  # 融合 decay
+
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            scores = scores.masked_fill(~causal_mask, 0.0)
+
+            if attention_mask is not None:
+                attn_mask = attention_mask.view(bsz, 1, 1, -1)
+                scores = scores.masked_fill(attn_mask == 0, 0)
+
+            scores = scores / scores.detach().abs().sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            output = scores @ v
+            cache = None
+
+        else:  # === recurrent 模式 ===
+            kv_sum, k_sum = (None, None)
+            if past_key_value is not None:
+                kv_sum, k_sum = past_key_value
+            if kv_sum is None:
+                kv_sum = torch.zeros(bsz, self.n_local_heads, self.head_dim, self.head_dim,
+                                     device=x.device, dtype=torch.float32)
+                k_sum = torch.zeros(bsz, self.n_local_heads, self.head_dim,
+                                    device=x.device, dtype=torch.float32)
+
+            q_t = q[:, :, 0, :].to(torch.float32)
+            k_t = k[:, :, 0, :].to(torch.float32)
+            v_t = v[:, :, 0, :].to(torch.float32)
+
+            # === 先 decay 之前的状态 ===
+            kv_sum = self.decay * kv_sum
+            k_sum = self.decay * k_sum
+
+            # 累加当前 token 的贡献
+            kv_sum = kv_sum + torch.einsum("bhd,bhe->bhde", k_t, v_t)
+            k_sum = k_sum + k_t
+
+            denom = (q_t * k_sum).sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            out_step = (q_t @ kv_sum) / denom
+
+            output = out_step.unsqueeze(2)
+            cache = (kv_sum, k_sum)
+
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, cache
+        
 # ========================
 #   MLP/Gating/MoE
 # ========================
@@ -262,7 +355,7 @@ class MOEFeedForward(nn.Module):
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
-        self.self_attn = LinearAttention(config)
+        self.self_attn = DecayLinearAttention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
