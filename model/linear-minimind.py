@@ -215,15 +215,16 @@ class LinearAttention(nn.Module):
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
         
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (bsz, heads, seq_len, head_dim)
+        # q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (bsz, heads, seq_len, head_dim)
         
         # === 1. 先做 feature map，保证正性 ===
         q, k = self.feature_map(q), self.feature_map(k)
-        
-        
-        # === 3. 对 feature map 后的 q,k 再做 RoPE，用于实际 attention 计算 ===
+
+        # === 2. 对 feature map 后的 q,k 再做 RoPE，用于实际 attention 计算 ===
         cos, sin = position_embeddings
         q_rope, k_rope = apply_rotary_pos_emb(q, k, cos[:seq_len], sin[:seq_len])
+        q_rope, k_rope = q_rope.transpose(1, 2), k_rope.transpose(1, 2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (bsz, heads, seq_len, head_dim)
         
         if seq_len > 1:
             # 注意力计算用加过 RoPE 的
