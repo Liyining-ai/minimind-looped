@@ -292,7 +292,6 @@ class DWCLinearAttention(nn.Module):
             cache = (kv_sum, k_sum)
 
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        output = self.resid_dropout(self.o_proj(output))
 
         # === 7. 局部位置增强 LePE (1D depthwise conv) ===
         v_lepe = v.transpose(1, 2).reshape(bsz, seq_len, -1).transpose(1, 2)  # (B, C, L)
@@ -300,6 +299,7 @@ class DWCLinearAttention(nn.Module):
         lepe_out = lepe_out.transpose(1, 2)                                   # (B, L, C)
         output = output + lepe_out
 
+        output = self.resid_dropout(self.o_proj(output))
         return output, cache
         
 #   MLP/Gating/MoE
