@@ -106,7 +106,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 #  Linear Attention
 #========================
-class DWCLinearAttention(nn.Module):
+class LinearAttention(nn.Module):
     def __init__(self, args: MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
@@ -200,7 +200,7 @@ class DWCLinearAttention(nn.Module):
 
 #  Linear Attention
 #========================
-class LinearAttention(nn.Module):
+class DWCLinearAttention(nn.Module):
     def __init__(self, args: MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
