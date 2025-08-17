@@ -215,7 +215,6 @@ class LinearAttention(nn.Module):
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
         
-        # q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (bsz, heads, seq_len, head_dim)
         
         # === 1. 先做 feature map，保证正性 ===
         q, k = self.feature_map(q), self.feature_map(k)
