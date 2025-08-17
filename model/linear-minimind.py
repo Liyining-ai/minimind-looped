@@ -184,8 +184,8 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 #         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
 #         output = self.resid_dropout(self.o_proj(output))
 #         return output, cache
-  Linear Attention
-========================
+#  Linear Attention
+#========================
 class LinearAttention(nn.Module):
     def __init__(self, args: MiniMindConfig):
         super().__init__()
