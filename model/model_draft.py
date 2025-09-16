@@ -136,7 +136,8 @@ class Attention(nn.Module):
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, 2 * args.hidden_size, bias=False)
+        self.gate = nn.Linear(args.hidden_size, args.hidden_size)
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
@@ -145,6 +146,7 @@ class Attention(nn.Module):
 
     def forward(self,
                 x: torch.Tensor,
+                y: torch.Tensor,
                 position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
@@ -192,11 +194,12 @@ class Attention(nn.Module):
 
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            output = scores @ xv
+            output = scores @ xv 
 
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1) * self.gate(y)
         output = self.resid_dropout(self.o_proj(output))
-        return output, past_kv
+        output_x , output_y = torch.split(output, [args.hidden_size, args.hidden_size], dim=-1)            
+        return output_x, output_y,  past_kv
 
 
 class FeedForward(nn.Module):
@@ -344,18 +347,21 @@ class MiniMindBlock(nn.Module):
 
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        residual = hidden_states
-        hidden_states, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states), position_embeddings,
+    def forward(self, hidden_states_x, hidden_states_y,  position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        residual_x = hidden_states_x
+        residual_y = hidden_states_y
+        hidden_states_x, hidden_states_y, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states_x),self.input_layernorm2(hidden_states_y), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
-        hidden_states += residual
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, present_key_value
+        hidden_states_x += residual_x
+        hidden_states_y += residual_y
+        hidden_states_x = hidden_states_x + self.mlp(self.post_attention_layernorm(hidden_states_x))
+        return hidden_states_x, hidden_states_y, present_key_value
 
 
 class MiniMindModel(nn.Module):
@@ -366,7 +372,7 @@ class MiniMindModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(2 * config.hidden_size, eps=config.rms_norm_eps)
 
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, theta=config.rope_theta)
@@ -392,8 +398,9 @@ class MiniMindModel(nn.Module):
 
         presents = []
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
-            hidden_states, present = layer(
-                hidden_states,
+            hidden_states_x, hidden_states_y, present = layer(
+                hidden_states_x,
+                hidden_states_y,
                 position_embeddings,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
@@ -401,6 +408,7 @@ class MiniMindModel(nn.Module):
             )
             presents.append(present)
 
+        hidden_states = torch.cat([hidden_states_x, hidden_states_y], dim=-1)
         hidden_states = self.norm(hidden_states)
 
         aux_loss = sum(
@@ -419,7 +427,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
-        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(2 * self.config.hidden_size, self.config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
         self.OUT = CausalLMOutputWithPast()
 
