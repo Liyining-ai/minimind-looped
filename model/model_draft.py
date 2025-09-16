@@ -389,7 +389,7 @@ class MiniMindModel(nn.Module):
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        hidden_states_x, hidden_states_y = torch.split(self.dropout(self.embed_tokens(input_ids)), [self.hidden_size ,self.hidden_size ], dim=-1)
 
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_length],
