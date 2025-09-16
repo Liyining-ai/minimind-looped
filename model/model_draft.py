@@ -133,6 +133,7 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
+        self.hidden_size = args.hidden_size
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
@@ -198,7 +199,7 @@ class Attention(nn.Module):
 
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1) * self.gate(y)
         output = self.resid_dropout(self.o_proj(output))
-        output_x , output_y = torch.split(output, [args.hidden_size, args.hidden_size], dim=-1)            
+        output_x , output_y = torch.split(output, [self.hidden_size, self.hidden_size], dim=-1)            
         return output_x, output_y,  past_kv
 
 
@@ -358,8 +359,8 @@ class MiniMindBlock(nn.Module):
             self.input_layernorm(hidden_states_x),self.input_layernorm2(hidden_states_y), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
-        hidden_states_x += residual_x
-        hidden_states_y += residual_y
+        hidden_states_x = hidden_states_x + residual_x
+        hidden_states_y = hidden_states_y + residual_y
         hidden_states_x = hidden_states_x + self.mlp(self.post_attention_layernorm(hidden_states_x))
         return hidden_states_x, hidden_states_y, present_key_value
 
@@ -371,6 +372,7 @@ class MiniMindModel(nn.Module):
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
+        self.hidden_size = config.hidden_size
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(2 * config.hidden_size, eps=config.rms_norm_eps)
 
