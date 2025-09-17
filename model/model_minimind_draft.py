@@ -374,6 +374,7 @@ class MiniMindModel(nn.Module):
             nn.Sequential(nn.LayerNorm(self.num_features), nn.Linear(self.num_features, self.num_features))
             for i in range((depth - 1) // meta_depth)])
         self.norm = RMSNorm(2 * config.hidden_size, eps=config.rms_norm_eps)
+        self.act = nn.GELU()
 
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, theta=config.rope_theta)
