@@ -54,6 +54,8 @@ class MiniMindConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.flash_attn = flash_attn
         ####################################################
+        self.meta_depth = 2
+        ####################################################
         # Here are the specific configurations of MOE
         # When use_moe is false, the following is invalid
         ####################################################
@@ -133,12 +135,10 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
-        self.hidden_size = args.hidden_size
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, 2 * args.hidden_size, bias=False)
-        self.gate = nn.Linear(args.hidden_size, args.hidden_size)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
@@ -147,7 +147,6 @@ class Attention(nn.Module):
 
     def forward(self,
                 x: torch.Tensor,
-                y: torch.Tensor,
                 position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
@@ -195,12 +194,12 @@ class Attention(nn.Module):
 
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            output = scores @ xv 
+            output = scores @ xv
 
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1) * self.gate(y)
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
-        output_x , output_y = torch.split(output, [self.hidden_size, self.hidden_size], dim=-1)            
-        return output_x, output_y,  past_kv
+        return output, past_kv
+
 
 
 class FeedForward(nn.Module):
@@ -348,21 +347,18 @@ class MiniMindBlock(nn.Module):
 
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
-    def forward(self, hidden_states_x, hidden_states_y,  position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        residual_x = hidden_states_x
-        residual_y = hidden_states_y
-        hidden_states_x, hidden_states_y, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states_x),self.input_layernorm2(hidden_states_y), position_embeddings,
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
-        hidden_states_x = hidden_states_x + residual_x
-        hidden_states_y = hidden_states_y + residual_y
-        hidden_states_x = hidden_states_x + self.mlp(self.post_attention_layernorm(hidden_states_x))
-        return hidden_states_x, hidden_states_y, present_key_value
+        hidden_states += residual
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
 
 
 class MiniMindModel(nn.Module):
@@ -374,6 +370,9 @@ class MiniMindModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.hidden_size = config.hidden_size
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.linear = nn.ModuleList([
+            nn.Sequential(nn.LayerNorm(self.num_features), nn.Linear(self.num_features, self.num_features))
+            for i in range((depth - 1) // meta_depth)])
         self.norm = RMSNorm(2 * config.hidden_size, eps=config.rms_norm_eps)
 
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
@@ -400,17 +399,21 @@ class MiniMindModel(nn.Module):
 
         presents = []
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
-            hidden_states_x, hidden_states_y, present = layer(
+            hidden_states_x, present = layer(
                 hidden_states_x,
-                hidden_states_y,
                 position_embeddings,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
                 attention_mask=attention_mask
             )
             presents.append(present)
+            if (layer_idx + 1) % self.meta_depth == 0 and (layer_idx + 1) < len(self.layers):
+                hidden_states_x = torch.cat([hidden_states_x, self.act(hidden_states_y)], dim=-1)
+                hidden_states_x = self.linear[i // self.meta_depth](hidden_states_x)
+                hidden_states_x, hidden_states_y = torch.split(hidden_states_x, [self.embed_dim, hidden_states_x.shape[-1] - self.embed_dim], dim=-1)
+        hidden_states = torch.cat([hidden_states_x, self.act(hidden_states_y)], dim=-1)
 
-        hidden_states = torch.cat([hidden_states_x, hidden_states_y], dim=-1)
+        
         hidden_states = self.norm(hidden_states)
 
         aux_loss = sum(
@@ -420,6 +423,7 @@ class MiniMindModel(nn.Module):
         )
 
         return hidden_states, presents, aux_loss
+
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
