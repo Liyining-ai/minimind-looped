@@ -411,7 +411,7 @@ class MiniMindModel(nn.Module):
             if (layer_idx + 1) % self.meta_depth == 0 and (layer_idx + 1) < len(self.layers):
                 hidden_states_x = torch.cat([hidden_states_x, self.act(hidden_states_y)], dim=-1)
                 hidden_states_x = self.linear[i // self.meta_depth](hidden_states_x)
-                hidden_states_x, hidden_states_y = torch.split(hidden_states_x, [self.embed_dim, hidden_states_x.shape[-1] - self.embed_dim], dim=-1)
+                hidden_states_x, hidden_states_y = torch.split(hidden_states_x, [self.hidden_size, hidden_states_x.shape[-1] - self.hidden_size], dim=-1)
         hidden_states = torch.cat([hidden_states_x, self.act(hidden_states_y)], dim=-1)
 
         
