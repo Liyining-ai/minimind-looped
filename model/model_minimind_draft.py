@@ -369,10 +369,11 @@ class MiniMindModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.hidden_size = config.hidden_size
+        self.meta_depth = config.meta_depth
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.linear = nn.ModuleList([
-            nn.Sequential(nn.LayerNorm(self.num_features), nn.Linear(self.num_features, self.num_features))
-            for i in range((depth - 1) // meta_depth)])
+            nn.Sequential(nn.LayerNorm(2 * config.hidden_size), nn.Linear(2 * config.hidden_size, 2 * config.hidden_size))
+            for i in range((config.num_hidden_layers - 1) // config.meta_depth)])
         self.norm = RMSNorm(2 * config.hidden_size, eps=config.rms_norm_eps)
         self.act = nn.GELU()
 
@@ -410,7 +411,7 @@ class MiniMindModel(nn.Module):
             presents.append(present)
             if (layer_idx + 1) % self.meta_depth == 0 and (layer_idx + 1) < len(self.layers):
                 hidden_states_x = torch.cat([hidden_states_x, self.act(hidden_states_y)], dim=-1)
-                hidden_states_x = self.linear[i // self.meta_depth](hidden_states_x)
+                hidden_states_x = self.linear[layer_idx // self.meta_depth](hidden_states_x)
                 hidden_states_x, hidden_states_y = torch.split(hidden_states_x, [self.hidden_size, hidden_states_x.shape[-1] - self.hidden_size], dim=-1)
         hidden_states = torch.cat([hidden_states_x, self.act(hidden_states_y)], dim=-1)
 
